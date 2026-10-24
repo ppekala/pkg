@@ -25,7 +25,229 @@ tests_init \
 	upgrade_all_disabled_repos \
 	upgrade_vulnerable \
 	upgrade_options_changed \
-	upgrade_options_added_removed
+	upgrade_options_added_removed \
+	no_remove \
+	never_remove \
+	confirm_removal \
+	hold_back \
+	hold_back_force \
+	removal_automatic
+
+# bar-1.0 owns ${TMPDIR}/file1 and is installed, either explicitly or, when no
+# is passed as first argument, as an automatic package.  The repository then
+# offers bar1-1.1, which owns the same file and is requested explicitly:
+# installing it cannot be given up, so bar-1.0 has to go.
+removal_setup() {
+	explicit_bar="${1:-yes}"
+
+	echo "bar-1.0" > file1
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg bar bar 1.0 "${TMPDIR}"
+	cat << EOF >> bar.ucl
+files: {
+	${TMPDIR}/file1: "",
+}
+EOF
+
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./bar.ucl -o ./repo/
+
+	cat << EOF > pkg.conf
+PKG_DBDIR=${TMPDIR}
+REPOS_DIR=[]
+repositories: {
+	local: { url : file://${TMPDIR}/repo }
+}
+EOF
+
+	atf_check -o inline:"Creating repository in ./repo:  done\nPacking files for repository:  done\n" \
+		-e empty -s exit:0 pkg -C ./pkg.conf repo ./repo
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf update -f
+
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf install -y bar
+	if [ "${explicit_bar}" != "yes" ]; then
+		atf_check -o ignore -s exit:0 pkg -C ./pkg.conf set -y -A 1 bar
+	fi
+
+	rm -fr repo
+	echo "bar-1.1" > file1
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg bar1 bar1 1.1 "${TMPDIR}"
+	cat << EOF >> bar1.ucl
+files: {
+	${TMPDIR}/file1: "",
+}
+EOF
+
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./bar1.ucl -o ./repo/
+
+	atf_check -o inline:"Creating repository in ./repo:  done\nPacking files for repository:  done\n" \
+		-e empty -s exit:0 pkg -C ./pkg.conf repo ./repo
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf update -f
+}
+
+# A repository where upgrading foo brings a new bar1 which conflicts with the
+# installed bar, both being non-automatic: the upgrade of foo has to be held
+# back rather than removing a package that the user installed.
+hold_back_setup() {
+	echo "bar-1.0" > file1
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg bar bar 1.0 "${TMPDIR}"
+	cat << EOF >> bar.ucl
+files: {
+	${TMPDIR}/file1: "",
+}
+EOF
+
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg foo foo 1.0 "${TMPDIR}"
+	cat << EOF >> foo.ucl
+deps: {
+	bar: {
+		origin: "bar",
+		version: "1.0"
+	}
+}
+EOF
+
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./bar.ucl -o ./repo/
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./foo.ucl -o ./repo/
+
+	cat << EOF > pkg.conf
+PKG_DBDIR=${TMPDIR}
+REPOS_DIR=[]
+repositories: {
+	local: { url : file://${TMPDIR}/repo }
+}
+EOF
+
+	atf_check -o inline:"Creating repository in ./repo:  done\nPacking files for repository:  done\n" \
+		-e empty -s exit:0 pkg -C ./pkg.conf repo ./repo
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf update -f
+
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf install -y bar
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf install -y foo
+
+	rm -fr repo
+	echo "bar-1.1" > file1
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg bar1 bar1 1.1 "${TMPDIR}"
+	cat << EOF >> bar1.ucl
+files: {
+	${TMPDIR}/file1: "",
+}
+EOF
+
+	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg foo foo 1.0_1 "${TMPDIR}"
+	cat << EOF >> foo.ucl
+deps: {
+	bar1: {
+		origin: "bar1",
+		version: "1.1"
+	}
+}
+EOF
+
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./bar1.ucl -o ./repo/
+	atf_check -o empty -e empty -s exit:0 pkg create -M ./foo.ucl -o ./repo/
+
+	atf_check -o inline:"Creating repository in ./repo:  done\nPacking files for repository:  done\n" \
+		-e empty -s exit:0 pkg -C ./pkg.conf repo ./repo
+	atf_check -o ignore -s exit:0 pkg -C ./pkg.conf update -f
+}
+
+removal_automatic_body() {
+	# Here bar is automatic: removing it needs no extra confirmation and is
+	# not reported as an explicit removal
+	removal_setup no
+
+	printf 'y\n' | atf_check \
+		-o match:"1 package\\(s\\) will be REMOVED by this operation" \
+		-o not-match:"installed explicitly" \
+		-o not-match:"Confirm their removal" \
+		-e ignore \
+		-s exit:0 \
+		pkg -C ./pkg.conf install bar1
+
+	# pkg info with no pattern also prints the comment: do not anchor
+	atf_check -o not-match:"bar-1.0" -o match:"bar1-1.1" \
+		-e ignore -s exit:0 pkg -C ./pkg.conf info
+}
+
+# Upgrading foo would remove bar, which was installed explicitly: the upgrade
+# of foo is held back instead, and the user is told about it.
+hold_back_body() {
+	hold_back_setup
+
+	atf_check \
+		-o match:"foo-1.0_1 is held back to solve the problem" \
+		-o not-match:"Installed packages to be REMOVED" \
+		-e ignore \
+		-s exit:0 \
+		pkg -C ./pkg.conf upgrade -n -y
+
+	# Nothing was removed, foo was left at its installed version
+	atf_check -o match:"^bar-1.0$" -e empty -s exit:0 pkg -C ./pkg.conf info bar
+	atf_check -o match:"^foo-1.0$" -e empty -s exit:0 pkg -C ./pkg.conf info foo
+}
+
+# Forcing keeps its meaning: the user asked for the operation to happen even
+# if it costs a package.
+hold_back_force_body() {
+	hold_back_setup
+
+	atf_check \
+		-o match:"Installed packages to be REMOVED:" \
+		-o match:"bar: 1.0 \\(conflicts with bar1-1.1, which is being installed\\)" \
+		-e ignore \
+		-s exit:0 \
+		pkg -C ./pkg.conf upgrade -n -y -f
+}
+
+no_remove_body() {
+	removal_setup
+
+	# A dry run always reports the plan, removals included
+	atf_check \
+		-o match:"Installed packages to be REMOVED:" \
+		-o match:"bar: 1.0 \\(conflicts with bar1-1.1, which is being installed\\)" \
+		-e ignore \
+		-s exit:0 \
+		pkg -C ./pkg.conf install -n -y --no-remove bar1
+
+	# bar1 was requested explicitly, so bar has to be removed
+	atf_check \
+		-o ignore \
+		-e match:"bar-1.0 would be removed: conflicts with bar1-1.1, which is being installed" \
+		-e match:"--no-remove is set: refusing to remove 1 package" \
+		-s exit:1 \
+		pkg -C ./pkg.conf install -y --no-remove bar1
+
+	# Nothing was touched
+	atf_check -o match:"^bar-1.0$" -e empty -s exit:0 pkg -C ./pkg.conf info bar
+}
+
+never_remove_body() {
+	removal_setup
+
+	atf_check \
+		-o ignore \
+		-e match:"bar-1.0 would be removed: conflicts with bar1-1.1, which is being installed" \
+		-e match:"NEVER_REMOVE is set: refusing to remove 1 package" \
+		-s exit:1 \
+		pkg -C ./pkg.conf -o NEVER_REMOVE=YES install -y bar1
+
+	atf_check -o match:"^bar-1.0$" -e empty -s exit:0 pkg -C ./pkg.conf info bar
+}
+
+confirm_removal_body() {
+	removal_setup
+
+	# Answering yes to the installation and no to the removal of the
+	# package that was installed explicitly leaves the system untouched
+	printf 'y\nn\n' | atf_check \
+		-o match:"1 package\\(s\\) will be REMOVED by this operation, including 1 that you installed explicitly: bar-1.0" \
+		-o match:"Confirm their removal\\?" \
+		-e ignore \
+		-s exit:1 \
+		pkg -C ./pkg.conf install bar1
+
+	atf_check -o match:"^bar-1.0$" -e empty -s exit:0 pkg -C ./pkg.conf info bar
+}
 
 issue1881_body() {
 	atf_check -s exit:0 sh ${RESOURCEDIR}/test_subr.sh new_pkg pkg1 pkg_a 1
@@ -336,7 +558,7 @@ Checking for upgrades (1 candidates):  done
 Processing candidates (1 candidates):  done
 Checking integrity... done (1 conflicting)
   - myplop-2 conflicts with mymeta-1 on ${TMPDIR}/file-pkg-1/file
-Cannot solve problem using SAT solver, trying another plan
+myplop-2 is held back to solve the problem
 Checking integrity... done (0 conflicting)
 Your packages are up to date.
 "
@@ -383,7 +605,7 @@ Installed packages to be UPGRADED:
 	myplop: 1 -> 2
 
 Installed packages to be REMOVED:
-	mymeta: 1
+	mymeta: 1 (conflicts with myplop-2, which is being installed)
 
 Number of packages to be removed: 1
 Number of packages to be upgraded: 1
@@ -428,7 +650,7 @@ local repository is up to date.
 All repositories are up to date.
 Checking integrity... done (1 conflicting)
   - myplop-2 conflicts with mymeta-1 on ${TMPDIR}/file-pkg-1/file
-Cannot solve problem using SAT solver, trying another plan
+myplop-2 is held back to solve the problem
 Checking integrity... done (0 conflicting)
 Your packages are up to date.
 "

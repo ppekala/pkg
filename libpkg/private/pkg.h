@@ -24,7 +24,7 @@
 #include "private/pkg_abi.h"
 #include "private/utils.h"
 #include "private/fetch.h"
-#include "pkghash.h"
+#include "hash.h"
 #include "pkg/stringset.h"
 
 /*
@@ -261,6 +261,7 @@ struct pkg {
 	bool		 locked;
 	bool		 automatic;
 	bool		 vital;
+	bool		 user_vital;
 	int64_t		 id;
 	sb_t scripts[PKG_NUM_SCRIPTS];
 	charv_t	 lua_scripts[PKG_NUM_LUA_SCRIPTS];
@@ -292,15 +293,11 @@ struct pkg {
 	int64_t			 old_flatsize;
 	int64_t			 timestamp;
 	pkg_depv_t		 depends;
-	size_t			 depends_iter;
 	pkg_depv_t		 rdepends;
-	size_t			 rdepends_iter;
 	charv_t		 categories;
 	charv_t		 licenses;
 	pkg_filev_t		 files;
-	size_t			 files_iter;
 	pkg_dirv_t		 dirs;
-	size_t			 dirs_iter;
 	kvlist_t		 options;
 	charv_t		 users;
 	charv_t		 groups;
@@ -309,11 +306,9 @@ struct pkg {
 	charv_t		 shlibs_provided;
 	charv_t		 shlibs_provided_ignore;
 	pkg_conflictv_t		 conflicts;
-	size_t			 conflicts_iter;
 	charv_t		 provides;
 	charv_t		 requires;
 	pkg_configfilev_t	 config_files;
-	size_t			 config_files_iter;
 	kvlist_t		 annotations;
 	unsigned			flags;
 	int		rootfd;
@@ -323,6 +318,13 @@ struct pkg {
 	struct pkg_repo		*repo;
 	char			*rwhich_path;
 };
+
+static inline bool
+pkg_is_vital(const struct pkg *pkg)
+{
+	return (pkg->vital || pkg->user_vital);
+}
+
 typedef vec_t(struct pkg *) pkgs_t;
 
 DEFINE_VEC_INSERT_SORTED_PROTO(pkgs_t, pkgs, struct pkg *);
@@ -368,7 +370,7 @@ struct trigger {
 		int type;
 		bool sandbox;
 	} cleanup;
-	pkghash *matched;
+	hash_t *matched;
 };
 typedef vec_t(struct trigger *) trigger_t;
 
@@ -430,9 +432,10 @@ struct pkg_repo_create {
 	ucl_object_t *groups;
 	ucl_object_t *expired_packages;
 	struct {
-		char **argv;
-		int argc;
 		pkg_password_cb *cb;
+		const char *type;
+		const char *cmd;
+		const char *key;
 	} sign;
 };
 
@@ -487,7 +490,7 @@ struct pkg_repo_meta {
 	char *source_identifier;
 	int64_t revision;
 
-	pkghash *keys;
+	hash_t *keys;
 
 	time_t eol;
 
@@ -579,8 +582,8 @@ struct pkg_repo {
 	void *fetch_priv;
 	bool silent;
 
-	pkghash *trusted_fp;
-	pkghash *revoked_fp;
+	hash_t *trusted_fp;
+	hash_t *revoked_fp;
 
 	struct {
 		int in;
@@ -643,7 +646,7 @@ struct plist {
 	int64_t flatsize;
 	hardlinks_t hardlinks;
 	mode_t perm;
-	pkghash *keywords;
+	hash_t *keywords;
 	kvlist_t variables;
 	bool in_for_loop;
 	forloop_frame_t *forloop_stack;
@@ -763,11 +766,12 @@ bool pkg_repo_meta_is_old_file(const char *file, struct pkg_repo_meta *meta);
 typedef enum {
 	HASH_UNKNOWN,
 	HASH_SHA256,
-	HASH_BLAKE2
-} hash_t;
+	HASH_BLAKE2,
+	HASH_SHA512
+} checksum_type_t;
 
 struct fingerprint {
-	hash_t type;
+	checksum_type_t type;
 	char hash[BUFSIZ];
 };
 int pkg_repo_load_fingerprints(struct pkg_repo *repo);
@@ -864,7 +868,7 @@ int pkgdb_set_pkg_digest(struct pkgdb *db, struct pkg *pkg);
 int pkgdb_is_dir_used(struct pkgdb *db, struct pkg *p, const char *dir, int64_t *res);
 int pkgdb_file_set_cksum(struct pkgdb *db, struct pkg_file *file, const char *sha256);
 
-int pkg_emit_filelist(struct pkg *, FILE *, pkghash **dirs, int *ndirs);
+int pkg_emit_filelist(struct pkg *, FILE *, hash_t **dirs, int *ndirs);
 
 bool ucl_object_emit_buf(const ucl_object_t *obj, enum ucl_emitter emit_type,
     sb_t **buf);
@@ -898,6 +902,7 @@ pkg_checksum_type_t pkg_checksum_get_type(const char *cksum, size_t clen);
 pkg_checksum_type_t pkg_checksum_file_get_type(const char *cksum, size_t clen);
 const char* pkg_checksum_type_to_string(pkg_checksum_type_t type);
 size_t pkg_checksum_type_size(pkg_checksum_type_t type);
+size_t pkg_checksum_string_size(pkg_checksum_type_t type);
 int pkg_checksum_calculate(struct pkg *pkg, struct pkgdb *db, bool inc_scripts,
     bool inc_version, bool inc_files);
 char *pkg_checksum_generate_fileat(int fd, const char *path,

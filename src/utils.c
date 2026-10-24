@@ -36,7 +36,7 @@
 #include <errno.h>
 #include <pwd.h>
 #include <pkg.h>
-#include <pkghash.h>
+#include <hash.h>
 #include <xmalloc.h>
 #include <pkg/audit.h>
 
@@ -148,8 +148,10 @@ vquery_yesno(bool deft, const char *msg, va_list ap)
 	strlcpy(yesnomsg, msg, sizeof(yesnomsg));
 	append_yesno(default_yes || r, yesnomsg, sizeof yesnomsg);
 
-	pkg_vasprintf(&out, yesnomsg, ap);
-	printf("%s", out);
+	out = NULL;
+	if (pkg_vasprintf(&out, yesnomsg, ap) < 0)
+		out = NULL;
+	printf("%s", out != NULL ? out : yesnomsg);
 
 	for (;;) {
 		if ((linelen = getline(&line, &linecap, stdin)) != -1) {
@@ -1039,14 +1041,14 @@ namecmp(const void *a, const void *b)
 	return (pkg_namecmp(sda->new, sdb->new));
 }
 
-static pkghash *
+static hash_t *
 audit_check_summary(pkg_solved_display_t *disp)
 {
 	int pfd[2];
 	pid_t cld;
 	struct pkg_audit *audit;
 	struct pkg_audit_issues *issues;
-	pkghash *vulnerable = NULL;
+	hash_t *vulnerable = NULL;
 	FILE *in;
 	char *line = NULL;
 	size_t linecap = 0;
@@ -1122,11 +1124,11 @@ audit_check_summary(pkg_solved_display_t *disp)
 			return (NULL);
 		}
 
-		vulnerable = pkghash_new();
+		vulnerable = hash_new();
 		while ((linelen = getline(&line, &linecap, in)) > 0) {
 			if (line[linelen - 1] == '\n')
 				line[linelen - 1] = '\0';
-			pkghash_safe_add(vulnerable, line, NULL, NULL);
+			hash_safe_add(vulnerable, line, NULL, NULL);
 		}
 		free(line);
 		fclose(in);
@@ -1136,13 +1138,83 @@ audit_check_summary(pkg_solved_display_t *disp)
 				break;
 		}
 
-		if (pkghash_count(vulnerable) == 0) {
-			pkghash_destroy(vulnerable);
+		if (hash_count(vulnerable) == 0) {
+			hash_destroy(vulnerable);
 			return (NULL);
 		}
 
 		return (vulnerable);
 	}
+}
+
+bool
+confirm_jobs_action(struct pkg_jobs *jobs)
+{
+	struct pkg *new_pkg, *old_pkg;
+	void *iter = NULL;
+	int type, nremovals = 0, explicit_removals = 0;
+	bool automatic, ret;
+
+	type = pkg_jobs_type(jobs);
+
+	/*
+	 * There is no question to ask when the user asked to assume yes,
+	 * and no question at all in quiet mode.
+	 */
+	if (yes || quiet)
+		return (true);
+
+	if (type != PKG_JOBS_INSTALL && type != PKG_JOBS_UPGRADE)
+		return (query_yesno(false, "\nProceed with this action? "));
+
+	sb_t names = sb_init();
+	char prompt[BUFSIZ];
+
+	while (pkg_jobs_iter(jobs, &iter, &new_pkg, &old_pkg, &type)) {
+		if (type != PKG_SOLVED_DELETE)
+			continue;
+
+		pkg_get(new_pkg, PKG_ATTR_AUTOMATIC, &automatic);
+		nremovals++;
+		if (automatic)
+			continue;
+
+		explicit_removals++;
+		if (names.len > 0)
+			sb_cat_c(&names, ' ');
+		pkg_sb_printf(&names, "%n-%v", new_pkg, new_pkg);
+	}
+
+	if (nremovals > 0) {
+		printf("\n>>> %d package(s) will be REMOVED by this operation",
+		    nremovals);
+		if (explicit_removals > 0)
+			printf(", including %d that you installed "
+			    "explicitly: %s", explicit_removals,
+			    sb_str(&names));
+		putchar('\n');
+	}
+
+	if (nremovals > 0)
+		snprintf(prompt, sizeof(prompt),
+		    "\nProceed with this action? "
+		    "(%d package(s) will be REMOVED) ", nremovals);
+	else
+		snprintf(prompt, sizeof(prompt),
+		    "\nProceed with this action? ");
+
+	ret = query_yesno(false, prompt);
+
+	if (ret && explicit_removals > 0) {
+		printf("\n>>> These packages were installed explicitly and "
+		    "removing them makes them disappear until they are "
+		    "installed again: %s\n", sb_str(&names));
+		ret = query_yesno(false, "\nConfirm their removal? ");
+	}
+
+	sb_fini(&names);
+
+	return (ret);
 }
 
 int
@@ -1171,7 +1243,7 @@ print_jobs_summary(struct pkg_jobs *jobs, const char *msg, ...)
 	}
 
 	/* Check packages against audit database for vulnerabilities */
-	pkghash *vulnerable = audit_check_summary(disp);
+	hash_t *vulnerable = audit_check_summary(disp);
 	int vuln_count = 0;
 	if (vulnerable != NULL) {
 		for (type = 0; type < PKG_DISPLAY_MAX; type++) {
@@ -1182,14 +1254,14 @@ print_jobs_summary(struct pkg_jobs *jobs, const char *msg, ...)
 				pkg_get(disp[type].d[i]->new, PKG_ATTR_VERSION, &v);
 				if (n != NULL && v != NULL) {
 					snprintf(nv, sizeof(nv), "%s-%s", n, v);
-					if (pkghash_get(vulnerable, nv) != NULL) {
+					if (hash_get(vulnerable, nv) != NULL) {
 						disp[type].d[i]->vulnerable = true;
 						vuln_count++;
 					}
 				}
 			}
 		}
-		pkghash_destroy(vulnerable);
+		hash_destroy(vulnerable);
 	}
 
 	for (type = 0; type < PKG_DISPLAY_MAX; type ++) {

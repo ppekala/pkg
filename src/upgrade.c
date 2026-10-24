@@ -39,7 +39,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pkg/sb.h>
-#include <pkghash.h>
+#include <hash.h>
 #include <pkg.h>
 
 #if __has_include(<sys/capsicum.h>)
@@ -55,17 +55,17 @@ static const char vuln_end_lit[] = "**END**";
 void
 usage_upgrade(void)
 {
-	fprintf(stderr, "Usage: pkg upgrade [-fInFqUy] [--autoremove] [-r reponame] [-Cgix] <pkg-name> ...\n\n");
+	fprintf(stderr, "Usage: pkg upgrade [-fInFNqUy] [--autoremove] [--no-remove] [-r reponame] [-Cgix] <pkg-name> ...\n\n");
 	fprintf(stderr, "For more information see 'pkg help upgrade'.\n");
 }
 
 static void
-add_to_check(pkghash *check, struct pkg *pkg)
+add_to_check(hash_t *check, struct pkg *pkg)
 {
 	const char *uid = NULL;
 
 	pkg_get(pkg, PKG_ATTR_UNIQUEID, &uid);
-	pkghash_safe_add(check, uid, pkg, NULL);
+	hash_safe_add(check, uid, pkg, NULL);
 }
 
 static void
@@ -74,7 +74,7 @@ check_vulnerable(struct pkg_audit *audit, struct pkgdb *db, int sock)
 	struct pkg_audit_issues	*issues;
 	struct pkgdb_it	*it = NULL;
 	struct pkg		*pkg = NULL;
-	pkghash			*check = NULL;
+	hash_t			*check = NULL;
 	const char		*uid;
 	FILE			*out;
 
@@ -90,7 +90,7 @@ check_vulnerable(struct pkg_audit *audit, struct pkgdb *db, int sock)
 		fclose(out);
 		return;
 	}
-	check = pkghash_new();
+	check = hash_new();
 
 	while (pkgdb_it_next(it, &pkg, PKG_LOAD_BASIC|PKG_LOAD_RDEPS) == EPKG_OK) {
 		if (pkg_type(pkg) == PKG_INSTALLED) {
@@ -122,7 +122,7 @@ check_vulnerable(struct pkg_audit *audit, struct pkgdb *db, int sock)
 #endif
 
 	if (pkg_audit_process(audit) == EPKG_OK) {
-		pkghash_foreach(check, hit) {
+		hash_foreach(check, hit) {
 				issues = NULL;
 				pkg = (struct pkg *)hit.value;
 				if (pkg_audit_is_vulnerable(audit, pkg, &issues, true)) {
@@ -142,7 +142,7 @@ check_vulnerable(struct pkg_audit *audit, struct pkgdb *db, int sock)
 
 out_cleanup:
 	pkg_audit_free(audit);
-	pkghash_destroy(check);
+	hash_destroy(check);
 	fclose(out);
 }
 
@@ -263,13 +263,14 @@ exec_upgrade(int argc, char **argv)
 		{ "quiet",		no_argument,		NULL,	'q' },
 		{ "repository",		required_argument,	NULL,	'r' },
 		{ "no-repo-update",	no_argument,		NULL,	'U' },
+		{ "no-remove",		no_argument,		NULL,	'N' },
 		{ "regex",		no_argument,		NULL,	'x' },
 		{ "yes",		no_argument,		NULL,	'y' },
 		{ "vulnerable",		no_argument,		NULL,		'v' },
 		{ NULL,			0,			NULL,	0   },
 	};
 
-	while ((ch = getopt_long(argc, argv, "+CfFgiInqr:Uxyv", longopts, NULL)) != -1) {
+	while ((ch = getopt_long(argc, argv, "+CfFgiInNqr:Uxyv", longopts, NULL)) != -1) {
 		switch (ch) {
 		case 'C':
 			pkgdb_set_case_sensitivity(true);
@@ -294,6 +295,9 @@ exec_upgrade(int argc, char **argv)
 			f |= PKG_FLAG_DRY_RUN;
 			lock_type = PKGDB_LOCK_READONLY;
 			dry_run = true;
+			break;
+		case 'N':
+			f |= PKG_FLAG_NO_REMOVE;
 			break;
 		case 'q':
 			quiet = true;
@@ -401,8 +405,7 @@ exec_upgrade(int argc, char **argv)
 				nbactions, pkg_jobs_total(jobs));
 
 			if (!dry_run) {
-				rc = query_yesno(false, "\nProceed with this "
-						"action? ");
+				rc = confirm_jobs_action(jobs);
 			} else {
 				rc = false;
 			}

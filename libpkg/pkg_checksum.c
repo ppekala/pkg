@@ -33,17 +33,29 @@
 #include "pkg.h"
 #include "private/pkg.h"
 #include "private/event.h"
-#include "sha256.h"
+#define WITH_STDLIB
+#include "libecc/hash/hash_algs.h"
+#undef WITH_STDLIB
 #include "blake2.h"
 
 /* Separate checksum parts */
 #define PKG_CKSUM_SEPARATOR '$'
 
 /* Hash is in format <version>:<typeid>:<hexhash> */
-#define PKG_CHECKSUM_SHA256_LEN (SHA256_BLOCK_SIZE * 2 + 1)
+#define PKG_CHECKSUM_SHA256_LEN (SHA256_DIGEST_SIZE * 2 + 1)
+#define PKG_CHECKSUM_SHA512_LEN (SHA512_DIGEST_SIZE * 2 + 1)
 #define PKG_CHECKSUM_BLAKE2_LEN (BLAKE2B_OUTBYTES * 8 / 5 + sizeof("100") * 2 + 2)
 #define PKG_CHECKSUM_BLAKE2S_LEN (BLAKE2S_OUTBYTES * 8 / 5 + sizeof("100") * 2 + 2)
+#define PKG_CHECKSUM_BLAKE2_HEX_LEN (BLAKE2B_OUTBYTES * 2 + 1)
+#define PKG_CHECKSUM_BLAKE2S_HEX_LEN (BLAKE2S_OUTBYTES * 2 + 1)
 #define PKG_CHECKSUM_CUR_VERSION 2
+
+/*
+ * pkg_checksum_generate() stores the encoded digest behind a
+ * "<version>$<type>$" prefix, which the sizes above do not account for.
+ * sizeof() includes the terminating NUL.
+ */
+#define PKG_CHECKSUM_PREFIX_LEN sizeof("2$100$")
 
 struct kv {
 	const char *key;
@@ -67,6 +79,12 @@ static void pkg_checksum_hash_sha256_bulk(const unsigned char *in, size_t inlen,
 				unsigned char **out, size_t *outlen);
 static void pkg_checksum_hash_sha256_file(int fd, unsigned char **out,
     size_t *outlen);
+static void pkg_checksum_hash_sha512(kvv_t *entries,
+				unsigned char **out, size_t *outlen);
+static void pkg_checksum_hash_sha512_bulk(const unsigned char *in, size_t inlen,
+				unsigned char **out, size_t *outlen);
+static void pkg_checksum_hash_sha512_file(int fd, unsigned char **out,
+    size_t *outlen);
 static void pkg_checksum_hash_blake2(kvv_t *entries,
 				unsigned char **out, size_t *outlen);
 static void pkg_checksum_hash_blake2_bulk(const unsigned char *in, size_t inlen,
@@ -80,6 +98,8 @@ static void pkg_checksum_hash_blake2s_bulk(const unsigned char *in, size_t inlen
 static void pkg_checksum_hash_blake2s_file(int fd, unsigned char **out,
     size_t *outlen);
 static void pkg_checksum_encode_base32(unsigned char *in, size_t inlen,
+				char *out, size_t outlen);
+static void pkg_checksum_encode_base32_legacy(unsigned char *in, size_t inlen,
 				char *out, size_t outlen);
 static void pkg_checksum_encode_hex(unsigned char *in, size_t inlen,
 				char *out, size_t outlen);
@@ -98,7 +118,7 @@ static const struct _pkg_cksum_type {
 		pkg_checksum_hash_sha256,
 		pkg_checksum_hash_sha256_bulk,
 		pkg_checksum_hash_sha256_file,
-		pkg_checksum_encode_base32
+		pkg_checksum_encode_base32_legacy
 	},
 	[PKG_HASH_TYPE_SHA256_HEX] = {
 		"sha256_hex",
@@ -114,11 +134,11 @@ static const struct _pkg_cksum_type {
 		pkg_checksum_hash_blake2,
 		pkg_checksum_hash_blake2_bulk,
 		pkg_checksum_hash_blake2_file,
-		pkg_checksum_encode_base32
+		pkg_checksum_encode_base32_legacy
 	},
 	[PKG_HASH_TYPE_SHA256_RAW] = {
 		"sha256_raw",
-		SHA256_BLOCK_SIZE,
+		SHA256_DIGEST_SIZE,
 		pkg_checksum_hash_sha256,
 		pkg_checksum_hash_sha256_bulk,
 		pkg_checksum_hash_sha256_file,
@@ -138,7 +158,7 @@ static const struct _pkg_cksum_type {
 		pkg_checksum_hash_blake2s,
 		pkg_checksum_hash_blake2s_bulk,
 		pkg_checksum_hash_blake2s_file,
-		pkg_checksum_encode_base32
+		pkg_checksum_encode_base32_legacy
 	},
 	[PKG_HASH_TYPE_BLAKE2S_RAW] = {
 		"blake2s_raw",
@@ -147,6 +167,70 @@ static const struct _pkg_cksum_type {
 		pkg_checksum_hash_blake2s_bulk,
 		pkg_checksum_hash_blake2s_file,
 		NULL
+	},
+	[PKG_HASH_TYPE_SHA512_BASE32] = {
+		"sha512_base32",
+		PKG_CHECKSUM_SHA512_LEN,
+		pkg_checksum_hash_sha512,
+		pkg_checksum_hash_sha512_bulk,
+		pkg_checksum_hash_sha512_file,
+		pkg_checksum_encode_base32_legacy
+	},
+	[PKG_HASH_TYPE_SHA512_HEX] = {
+		"sha512_hex",
+		PKG_CHECKSUM_SHA512_LEN,
+		pkg_checksum_hash_sha512,
+		pkg_checksum_hash_sha512_bulk,
+		pkg_checksum_hash_sha512_file,
+		pkg_checksum_encode_hex
+	},
+	[PKG_HASH_TYPE_SHA512_RAW] = {
+		"sha512_raw",
+		SHA512_DIGEST_SIZE,
+		pkg_checksum_hash_sha512,
+		pkg_checksum_hash_sha512_bulk,
+		pkg_checksum_hash_sha512_file,
+		NULL
+	},
+	[PKG_HASH_TYPE_BLAKE2_HEX] = {
+		"blake2_hex",
+		PKG_CHECKSUM_BLAKE2_HEX_LEN,
+		pkg_checksum_hash_blake2,
+		pkg_checksum_hash_blake2_bulk,
+		pkg_checksum_hash_blake2_file,
+		pkg_checksum_encode_hex
+	},
+	[PKG_HASH_TYPE_BLAKE2S_HEX] = {
+		"blake2s_hex",
+		PKG_CHECKSUM_BLAKE2S_HEX_LEN,
+		pkg_checksum_hash_blake2s,
+		pkg_checksum_hash_blake2s_bulk,
+		pkg_checksum_hash_blake2s_file,
+		pkg_checksum_encode_hex
+	},
+	[PKG_HASH_TYPE_SHA256_ZBASE32] = {
+		"sha256_zbase32",
+		PKG_CHECKSUM_SHA256_LEN,
+		pkg_checksum_hash_sha256,
+		pkg_checksum_hash_sha256_bulk,
+		pkg_checksum_hash_sha256_file,
+		pkg_checksum_encode_base32
+	},
+	[PKG_HASH_TYPE_BLAKE2_ZBASE32] = {
+		"blake2_zbase32",
+		PKG_CHECKSUM_BLAKE2_LEN,
+		pkg_checksum_hash_blake2,
+		pkg_checksum_hash_blake2_bulk,
+		pkg_checksum_hash_blake2_file,
+		pkg_checksum_encode_base32
+	},
+	[PKG_HASH_TYPE_BLAKE2S_ZBASE32] = {
+		"blake2s_zbase32",
+		PKG_CHECKSUM_BLAKE2S_LEN,
+		pkg_checksum_hash_blake2s,
+		pkg_checksum_hash_blake2s_bulk,
+		pkg_checksum_hash_blake2s_file,
+		pkg_checksum_encode_base32
 	},
 	[PKG_HASH_TYPE_UNKNOWN] = {
 		NULL,
@@ -371,7 +455,7 @@ static void
 pkg_checksum_hash_sha256(kvv_t *entries,
 		unsigned char **out, size_t *outlen)
 {
-	SHA256_CTX sign_ctx;
+	sha256_context sign_ctx;
 
 	sha256_init(&sign_ctx);
 
@@ -379,22 +463,22 @@ pkg_checksum_hash_sha256(kvv_t *entries,
 		sha256_update(&sign_ctx, entries->d[i].key, strlen(entries->d[i].key));
 		sha256_update(&sign_ctx, entries->d[i].value, strlen(entries->d[i].value));
 	}
-	*out = xmalloc(SHA256_BLOCK_SIZE);
+	*out = xmalloc(SHA256_DIGEST_SIZE);
 	sha256_final(&sign_ctx, *out);
-	*outlen = SHA256_BLOCK_SIZE;
+	*outlen = SHA256_DIGEST_SIZE;
 }
 
 static void
 pkg_checksum_hash_sha256_bulk(const unsigned char *in, size_t inlen,
 				unsigned char **out, size_t *outlen)
 {
-	SHA256_CTX sign_ctx;
+	sha256_context sign_ctx;
 
-	*out = xmalloc(SHA256_BLOCK_SIZE);
+	*out = xmalloc(SHA256_DIGEST_SIZE);
 	sha256_init(&sign_ctx);
 	sha256_update(&sign_ctx, in, inlen);
 	sha256_final(&sign_ctx, *out);
-	*outlen = SHA256_BLOCK_SIZE;
+	*outlen = SHA256_DIGEST_SIZE;
 }
 
 static void
@@ -403,8 +487,8 @@ pkg_checksum_hash_sha256_file(int fd, unsigned char **out, size_t *outlen)
 	char buffer[8192];
 	ssize_t r;
 
-	SHA256_CTX sign_ctx;
-	*out = xmalloc(SHA256_BLOCK_SIZE);
+	sha256_context sign_ctx;
+	*out = xmalloc(SHA256_DIGEST_SIZE);
 	sha256_init(&sign_ctx);
 	while ((r = read(fd, buffer, sizeof(buffer))) > 0)
 		sha256_update(&sign_ctx, buffer, r);
@@ -415,7 +499,58 @@ pkg_checksum_hash_sha256_file(int fd, unsigned char **out, size_t *outlen)
 		return;
 	}
 	sha256_final(&sign_ctx, *out);
-	*outlen = SHA256_BLOCK_SIZE;
+	*outlen = SHA256_DIGEST_SIZE;
+}
+
+static void
+pkg_checksum_hash_sha512(kvv_t *entries,
+		unsigned char **out, size_t *outlen)
+{
+	sha512_context sign_ctx;
+
+	sha512_init(&sign_ctx);
+
+	vec_foreach(*entries, i) {
+		sha512_update(&sign_ctx, entries->d[i].key, strlen(entries->d[i].key));
+		sha512_update(&sign_ctx, entries->d[i].value, strlen(entries->d[i].value));
+	}
+	*out = xmalloc(SHA512_DIGEST_SIZE);
+	sha512_final(&sign_ctx, *out);
+	*outlen = SHA512_DIGEST_SIZE;
+}
+
+static void
+pkg_checksum_hash_sha512_bulk(const unsigned char *in, size_t inlen,
+				unsigned char **out, size_t *outlen)
+{
+	sha512_context sign_ctx;
+
+	*out = xmalloc(SHA512_DIGEST_SIZE);
+	sha512_init(&sign_ctx);
+	sha512_update(&sign_ctx, in, inlen);
+	sha512_final(&sign_ctx, *out);
+	*outlen = SHA512_DIGEST_SIZE;
+}
+
+static void
+pkg_checksum_hash_sha512_file(int fd, unsigned char **out, size_t *outlen)
+{
+	char buffer[8192];
+	ssize_t r;
+
+	sha512_context sign_ctx;
+	*out = xmalloc(SHA512_DIGEST_SIZE);
+	sha512_init(&sign_ctx);
+	while ((r = read(fd, buffer, sizeof(buffer))) > 0)
+		sha512_update(&sign_ctx, buffer, r);
+	if (r < 0) {
+		pkg_emit_errno(__func__, "read failed");
+		free(*out);
+		*out = NULL;
+		return;
+	}
+	sha512_final(&sign_ctx, *out);
+	*outlen = SHA512_DIGEST_SIZE;
 }
 
 static void
@@ -515,14 +650,51 @@ pkg_checksum_hash_blake2s_file(int fd, unsigned char **out, size_t *outlen)
 }
 
 /*
- * We use here z-base32 encoding described here:
+ * z-base-32 alphabet, see:
  * http://philzimmermann.com/docs/human-oriented-base-32-encoding.txt
  */
 static const char b32[]="ybndrfg8ejkmcpqxot1uwisza345h769";
 
-
+/*
+ * Standard z-base-32 encoding: the input bit stream is consumed most
+ * significant bit first and every group of 5 bits is mapped through the
+ * alphabet above.
+ */
 static void
 pkg_checksum_encode_base32(unsigned char *in, size_t inlen,
+				char *out, size_t outlen)
+{
+	size_t i, r = 0;
+	unsigned int acc = 0;
+	int nbits = 0;
+
+	if (outlen < (inlen * 8 + 4) / 5 + 1) {
+		pkg_emit_error("cannot encode base32 as outlen is not sufficient");
+		return;
+	}
+
+	for (i = 0; i < inlen; i++) {
+		acc = (acc << 8) | in[i];
+		nbits += 8;
+		while (nbits >= 5) {
+			nbits -= 5;
+			out[r++] = b32[(acc >> nbits) & 0x1F];
+		}
+	}
+	if (nbits > 0)
+		out[r++] = b32[(acc << (5 - nbits)) & 0x1F];
+
+	out[r] = 0;
+}
+
+/*
+ * Historical implementation kept for compatibility with the checksums it
+ * already produced: it consumes the input bits least significant bit
+ * first, which does not match the z-base-32 specification.  Checksums
+ * stored with the *_BASE32 types must keep using it.
+ */
+static void
+pkg_checksum_encode_base32_legacy(unsigned char *in, size_t inlen,
 				char *out, size_t outlen)
 {
 	size_t i;
@@ -624,6 +796,16 @@ pkg_checksum_type_size(pkg_checksum_type_t type)
 	return (checksum_types[type].hlen);
 }
 
+/*
+ * Size of the buffer pkg_checksum_generate() needs: the encoded digest
+ * and the prefix it writes in front of it.
+ */
+size_t
+pkg_checksum_string_size(pkg_checksum_type_t type)
+{
+	return (pkg_checksum_type_size(type) + PKG_CHECKSUM_PREFIX_LEN);
+}
+
 int
 pkg_checksum_calculate(struct pkg *pkg, struct pkgdb *db, bool inc_scripts,
     bool inc_version, bool inc_files)
@@ -645,8 +827,8 @@ pkg_checksum_calculate(struct pkg *pkg, struct pkgdb *db, bool inc_scripts,
 			type = repo->meta->digest_format;
 	}
 
-	new_digest = xmalloc(pkg_checksum_type_size(type));
-	if (pkg_checksum_generate(pkg, new_digest, pkg_checksum_type_size(type),
+	new_digest = xmalloc(pkg_checksum_string_size(type));
+	if (pkg_checksum_generate(pkg, new_digest, pkg_checksum_string_size(type),
 	    type, inc_scripts, inc_version, inc_files)
 			!= EPKG_OK) {
 		free(new_digest);

@@ -27,7 +27,7 @@ SRCS=	backup_lib.c \
 	pkg_osvf.c \
 	pkg_repo.c \
 	pkgdb_query.c \
-	sha256.c dns_utils.c \
+	dns_utils.c \
 	pkg_add.c \
 	pkg_create.c \
 	pkg_jobs_conflicts.c pkg_ports.c \
@@ -59,7 +59,7 @@ SRCS=	backup_lib.c \
 	fetch_libfetch.c \
 	fetch_file.c \
 	triggers.c \
-	pkghash.c \
+	hash.c \
 	yuarel.c \
 	json.c \
 	sb.c \
@@ -83,6 +83,8 @@ LOCAL_CFLAGS=	-I$(top_srcdir)/compat \
 		-I$(top_builddir)/libpkg/repo \
 		-I$(top_srcdir)/libpkg \
 		-I$(top_builddir)/libpkg \
+		-I$(top_srcdir)/libpkg/pkg \
+		-I$(top_builddir)/libpkg/pkg \
 		-I$(top_srcdir) \
 		-I$(top_builddir) \
 		-Wl,--as-needed \
@@ -206,7 +208,7 @@ install: all pkg.h lib$(LIB)$(LIBSOEXT) lib$(LIB)_flat.a
 	install -d -m 755 $(DESTDIR)$(includedir)
 	install -d -m 755 $(DESTDIR)$(includedir)/pkg
 	install -d -m 755 $(DESTDIR)$(pkgconfigdir)
-	install -m 644 lib$(LIB)$(LIBSOEXT) $(DESTDIR)$(libdir)/
+	$(INSTALL_LIB) -m 644 lib$(LIB)$(LIBSOEXT) $(DESTDIR)$(libdir)/
 	ln -sf lib$(LIB)$(LIBSOEXT) $(DESTDIR)$(libdir)/lib$(LIB)$(SH_SOEXT)
 	install -m 644 lib$(LIB)_flat.a $(DESTDIR)$(libdir)/lib$(LIB).a
 	install -m 644 pkg.h $(DESTDIR)$(includedir)/

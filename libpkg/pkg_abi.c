@@ -12,6 +12,7 @@
 #include "pkg_config.h"
 #endif
 
+#include <assert.h>
 #include <ctype.h>
 #include <paths.h>
 #include <string.h>
@@ -65,6 +66,8 @@ static const struct {
 	{ "riscv:64:hf", "riscv64" },
 	{ "riscv:64:cheri:hf", "riscv64c" },
 	{ "riscv:64:sf", "riscv64sf" },
+
+	{ "loongarch:64", "loongarch64" },
 };
 
 static const struct {
@@ -100,6 +103,7 @@ static const struct {
 	[PKG_ARCH_RISCV32] =		{"riscv32"},
 	[PKG_ARCH_RISCV64] =		{"riscv64"},
 	[PKG_ARCH_RISCV64C] =		{"riscv64c"},
+	[PKG_ARCH_LOONGARCH64] =	{"loongarch64"},
 	[PKG_ARCH_ANY] =		{"*"},
 };
 

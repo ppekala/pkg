@@ -81,6 +81,7 @@ extern struct pkg_ctx ctx;
 
 static int pkgdb_upgrade(struct pkgdb *);
 static int pkgdb_init(sqlite3 *sdb);
+static bool pkgdb_kv_exists(struct pkgdb *db, enum pkgdb_kv kv);
 static int prstmt_initialize(struct pkgdb *db);
 static void prstmt_finalize(struct pkgdb *db);
 static int pkgdb_insert_scripts(struct pkg *pkg, int64_t package_id, sqlite3 *s);
@@ -1204,6 +1205,50 @@ retry:
 				pkgdb_close(db);
 				return (EPKG_FATAL);
 			}
+
+			/*
+			 * Create the local key/value tables on demand.
+			 * They are deliberately kept out of the versioned
+			 * schema so that introducing a new local or
+			 * extended attribute never requires a migration.
+			 * Values are dynamically typed.
+			 */
+			if (sql_exec(db->sqlite,
+			    "CREATE TABLE IF NOT EXISTS pkg_local ("
+				"name TEXT NOT NULL, "
+				"key TEXT NOT NULL, "
+				"value, "
+				"PRIMARY KEY (name, key)"
+			    ") WITHOUT ROWID;"
+			    "CREATE INDEX IF NOT EXISTS pkg_local_key "
+				"ON pkg_local(key);"
+			    "CREATE TABLE IF NOT EXISTS pkg_attr ("
+				"name TEXT NOT NULL, "
+				"key TEXT NOT NULL, "
+				"value, "
+				"PRIMARY KEY (name, key)"
+			    ") WITHOUT ROWID;"
+			    "CREATE INDEX IF NOT EXISTS pkg_attr_key "
+				"ON pkg_attr(key);") != EPKG_OK) {
+				pkgdb_close(db);
+				return (EPKG_FATAL);
+			}
+		} else {
+			/*
+			 * Read-only database: expose empty temporary
+			 * tables so that the SQL queries referring to
+			 * them stay valid.
+			 */
+			if (!pkgdb_kv_exists(db, PKGDB_KV_LOCAL))
+				sql_exec(db->sqlite,
+				    "CREATE TEMP TABLE IF NOT EXISTS pkg_local "
+				    "(name TEXT NOT NULL, key TEXT NOT NULL, "
+				    "value);");
+			if (!pkgdb_kv_exists(db, PKGDB_KV_ATTR))
+				sql_exec(db->sqlite,
+				    "CREATE TEMP TABLE IF NOT EXISTS pkg_attr "
+				    "(name TEXT NOT NULL, key TEXT NOT NULL, "
+				    "value);");
 		}
 
 		/*
@@ -1267,6 +1312,9 @@ pkgdb_close(struct pkgdb *db)
 {
 	if (db == NULL)
 		return;
+
+	hash_destroy(db->user_vital);
+	db->user_vital = NULL;
 
 	if (db->prstmt_initialized)
 		prstmt_finalize(db);
@@ -2792,6 +2840,228 @@ pkgdb_set2(struct pkgdb *db, struct pkg *pkg, ...)
 	va_end(ap);
 
 	return (ret);
+}
+
+static const char *
+pkgdb_kv_table(enum pkgdb_kv kv)
+{
+	static const char *tables[PKGDB_KV_NKIND] = {
+		[PKGDB_KV_LOCAL] = "pkg_local",
+		[PKGDB_KV_ATTR] = "pkg_attr",
+	};
+
+	return (tables[kv]);
+}
+
+static bool
+pkgdb_kv_exists(struct pkgdb *db, enum pkgdb_kv kv)
+{
+	static const char sql[] = ""
+	    "SELECT 1 FROM sqlite_master "
+	    "WHERE type = 'table' AND name = ?1";
+	sqlite3_stmt *stmt;
+	bool present = false;
+
+	if (db->kv_checked[kv])
+		return (db->kv_present[kv]);
+
+	if (sqlite3_prepare_v2(db->sqlite, sql, -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, pkgdb_kv_table(kv), -1,
+		    SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW)
+			present = true;
+		sqlite3_finalize(stmt);
+	}
+
+	db->kv_checked[kv] = true;
+	db->kv_present[kv] = present;
+
+	return (present);
+}
+
+static int
+pkgdb_kv_set(struct pkgdb *db, enum pkgdb_kv kv, const char *name,
+    const char *key, const char *value)
+{
+	char *sql;
+	sqlite3_stmt *stmt;
+
+	if (value != NULL)
+		xasprintf(&sql, "INSERT INTO %s(name, key, value) "
+		    "VALUES(?1, ?2, ?3) ON CONFLICT(name, key) "
+		    "DO UPDATE SET value = excluded.value", pkgdb_kv_table(kv));
+	else
+		xasprintf(&sql, "DELETE FROM %s WHERE name = ?1 AND key = ?2",
+		    pkgdb_kv_table(kv));
+
+	stmt = prepare_sql(db->sqlite, sql);
+	free(sql);
+	if (stmt == NULL)
+		return (EPKG_FATAL);
+
+	sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 2, key, -1, SQLITE_STATIC);
+	if (value != NULL)
+		sqlite3_bind_text(stmt, 3, value, -1, SQLITE_STATIC);
+
+	pkgdb_debug(4, stmt);
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		ERROR_STMT_SQLITE(db->sqlite, stmt);
+		sqlite3_finalize(stmt);
+		return (EPKG_FATAL);
+	}
+	sqlite3_finalize(stmt);
+
+	return (EPKG_OK);
+}
+
+static int
+pkgdb_kv_get(struct pkgdb *db, enum pkgdb_kv kv, const char *name,
+    const char *key, char **value)
+{
+	char *sql;
+	sqlite3_stmt *stmt;
+	const unsigned char *v;
+	int ret;
+
+	*value = NULL;
+
+	if (!pkgdb_kv_exists(db, kv))
+		return (EPKG_OK);
+
+	xasprintf(&sql, "SELECT value FROM %s WHERE name = ?1 AND key = ?2",
+	    pkgdb_kv_table(kv));
+	stmt = prepare_sql(db->sqlite, sql);
+	free(sql);
+	if (stmt == NULL)
+		return (EPKG_FATAL);
+
+	sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+	sqlite3_bind_text(stmt, 2, key, -1, SQLITE_STATIC);
+
+	pkgdb_debug(4, stmt);
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW) {
+		v = sqlite3_column_text(stmt, 0);
+		if (v != NULL)
+			*value = xstrdup((const char *)v);
+	} else if (ret != SQLITE_DONE) {
+		ERROR_STMT_SQLITE(db->sqlite, stmt);
+		sqlite3_finalize(stmt);
+		return (EPKG_FATAL);
+	}
+	sqlite3_finalize(stmt);
+
+	return (EPKG_OK);
+}
+
+static int
+pkgdb_kv_purge(struct pkgdb *db, enum pkgdb_kv kv, const char *name)
+{
+	char *sql;
+	sqlite3_stmt *stmt;
+
+	if (!pkgdb_kv_exists(db, kv))
+		return (EPKG_OK);
+
+	xasprintf(&sql, "DELETE FROM %s WHERE name = ?1", pkgdb_kv_table(kv));
+	stmt = prepare_sql(db->sqlite, sql);
+	free(sql);
+	if (stmt == NULL)
+		return (EPKG_FATAL);
+
+	sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+
+	pkgdb_debug(4, stmt);
+	if (sqlite3_step(stmt) != SQLITE_DONE) {
+		ERROR_STMT_SQLITE(db->sqlite, stmt);
+		sqlite3_finalize(stmt);
+		return (EPKG_FATAL);
+	}
+	sqlite3_finalize(stmt);
+
+	return (EPKG_OK);
+}
+
+int
+pkgdb_local_set(struct pkgdb *db, const char *name, const char *key,
+    const char *value)
+{
+	int ret;
+
+	ret = pkgdb_kv_set(db, PKGDB_KV_LOCAL, name, key, value);
+	if (ret == EPKG_OK) {
+		hash_destroy(db->user_vital);
+		db->user_vital = NULL;
+	}
+
+	return (ret);
+}
+
+int
+pkgdb_local_get(struct pkgdb *db, const char *name, const char *key,
+    char **value)
+{
+	return (pkgdb_kv_get(db, PKGDB_KV_LOCAL, name, key, value));
+}
+
+int
+pkgdb_attr_set(struct pkgdb *db, const char *name, const char *key,
+    const char *value)
+{
+	return (pkgdb_kv_set(db, PKGDB_KV_ATTR, name, key, value));
+}
+
+int
+pkgdb_attr_get(struct pkgdb *db, const char *name, const char *key,
+    char **value)
+{
+	return (pkgdb_kv_get(db, PKGDB_KV_ATTR, name, key, value));
+}
+
+int
+pkgdb_local_purge(struct pkgdb *db, const char *name)
+{
+	hash_destroy(db->user_vital);
+	db->user_vital = NULL;
+
+	return (pkgdb_kv_purge(db, PKGDB_KV_LOCAL, name));
+}
+
+int
+pkgdb_attr_purge(struct pkgdb *db, const char *name)
+{
+	return (pkgdb_kv_purge(db, PKGDB_KV_ATTR, name));
+}
+
+void
+pkgdb_local_apply(struct pkgdb *db, struct pkg *pkg)
+{
+	static const char sql[] = ""
+	    "SELECT name FROM pkg_local WHERE key = 'vital' AND value <> '0'";
+	sqlite3_stmt *stmt;
+	const unsigned char *name;
+
+	if (pkg->type != PKG_INSTALLED || pkg->name == NULL)
+		return;
+
+	if (db->user_vital == NULL) {
+		db->user_vital = hash_new();
+		if (pkgdb_kv_exists(db, PKGDB_KV_LOCAL) &&
+		    sqlite3_prepare_v2(db->sqlite, sql, -1, &stmt, NULL) ==
+		    SQLITE_OK) {
+			while (sqlite3_step(stmt) == SQLITE_ROW) {
+				name = sqlite3_column_text(stmt, 0);
+				if (name != NULL)
+					hash_add(db->user_vital,
+					    (const char *)name, NULL, NULL);
+			}
+			sqlite3_finalize(stmt);
+		}
+	}
+
+	if (hash_get(db->user_vital, pkg->name) != NULL)
+		pkg->user_vital = true;
 }
 
 /*

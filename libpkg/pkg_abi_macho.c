@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <assert.h>
 #include <errno.h>
 
 #include "private/binfmt.h"
@@ -98,6 +99,7 @@ pkg_arch_to_cputype(enum pkg_arch arch) {
 		cpu.subtype_ppc = CPU_SUBTYPE_POWERPC_ALL;
 		break;
 	case PKG_ARCH_ANY:
+	case PKG_ARCH_LOONGARCH64:
 	case PKG_ARCH_POWERPC64LE:
 	case PKG_ARCH_RISCV32:
 	case PKG_ARCH_RISCV64:

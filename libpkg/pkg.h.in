@@ -422,7 +422,8 @@ typedef enum _pkg_flags {
 	PKG_FLAG_NOEXEC = (1U << 14),
 	PKG_FLAG_KEEPFILES = (1U << 15),
 	PKG_FLAG_REGISTER_ONLY = (1U << 16),
-	PKG_FLAG_FETCH_SYMLINK = (1U << 17)
+	PKG_FLAG_FETCH_SYMLINK = (1U << 17),
+	PKG_FLAG_NO_REMOVE = (1U << 18)
 } pkg_flags;
 
 typedef enum _pkg_stats_t {
@@ -866,7 +867,10 @@ void pkg_repo_create_set_hash(struct pkg_repo_create *prc, bool);
 void pkg_repo_create_set_hash_symlink(struct pkg_repo_create *prc, bool);
 void pkg_repo_create_set_output_dir(struct pkg_repo_create *prc, const char *);
 void pkg_repo_create_set_metafile(struct pkg_repo_create *prc, const char *);
-void pkg_repo_create_set_sign(struct pkg_repo_create *prc, char **argv, int argc, pkg_password_cb *cb);
+void pkg_repo_create_set_password_cb(struct pkg_repo_create *prc, pkg_password_cb *);
+void pkg_repo_create_set_signtype(struct pkg_repo_create *prc, const char *);
+void pkg_repo_create_set_signcmd(struct pkg_repo_create *prc, const char *);
+void pkg_repo_create_set_signkey(struct pkg_repo_create *prc, const char *);
 void pkg_repo_create_set_groups(struct pkg_repo_create *prc, const char *);
 void pkg_repo_create_set_expired_packages(struct pkg_repo_create *prc, const char *);
 int pkg_repo_create(struct pkg_repo_create *, char *path);
@@ -997,6 +1001,15 @@ int pkgdb_modify_annotation(struct pkgdb *db, struct pkg *pkg,
 	const char *tag, const char *value);
 int pkgdb_delete_annotation(struct pkgdb *db, struct pkg *pkg,
 	const char *tag);
+
+int pkgdb_local_set(struct pkgdb *db, const char *name, const char *key,
+	const char *value);
+int pkgdb_local_get(struct pkgdb *db, const char *name, const char *key,
+	char **value);
+int pkgdb_attr_set(struct pkgdb *db, const char *name, const char *key,
+	const char *value);
+int pkgdb_attr_get(struct pkgdb *db, const char *name, const char *key,
+	char **value);
 
 #define PKG_LOAD_BASIC			0
 #define PKG_LOAD_DEPS			(1U << 0)

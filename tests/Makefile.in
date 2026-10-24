@@ -8,6 +8,7 @@ TESTS=	\
 	pkg_add_dir_to_del \
 	pkg_cpe \
 	pkg_jobs_need_upgrade \
+	pkgdb_local \
 	pkg_printf \
 	pkg_repo_meta \
 	pkg_validation \
@@ -66,6 +67,7 @@ TESTS_SH= \
 	frontend/rwhich.sh \
 	frontend/rootdir.sh \
 	frontend/rubypuppet.sh \
+	frontend/scheduling.sh \
 	frontend/search.sh \
 	frontend/set.sh \
 	frontend/version.sh \
@@ -106,6 +108,7 @@ TESTS_SHELL_BINS= \
 	frontend/freebsd-armv6.bin \
 	frontend/freebsd-armv7.bin \
 	frontend/freebsd-i386.bin \
+	frontend/freebsd-loongarch64.bin \
 	frontend/freebsd-powerpc.bin \
 	frontend/freebsd-powerpc64.bin \
 	frontend/freebsd-powerpc64le.bin \
@@ -131,6 +134,7 @@ deps_formula_OBJS=	lib/deps_formula.o
 pkg_add_dir_to_del_OBJS=	lib/pkg_add_dir_to_del.o
 pkg_cpe_OBJS=	lib/pkg_cpe.o
 pkg_jobs_need_upgrade_OBJS=	lib/pkg_jobs_need_upgrade.o
+pkgdb_local_OBJS=	lib/pkgdb_local.o
 pkg_validation_OBJS=	lib/pkg_validation.o
 packing_OBJS=	lib/packing.o
 ssh_OBJS=	lib/ssh.o
@@ -162,6 +166,7 @@ SRCS=	\
 	$(pkg_add_dir_to_del_OBJS:.o=.c) \
 	$(pkg_cpe_OBJS:.o=.c) \
 	$(pkg_jobs_need_upgrade_OBJS:.o=.c) \
+	$(pkgdb_local_OBJS:.o=.c) \
 	$(pkg_validation_OBJS:.o=.c) \
 	$(pkg_osvf_OBJS:.o=.c) \
 	$(pkg_repo_meta_OBJS:.o=.c) \

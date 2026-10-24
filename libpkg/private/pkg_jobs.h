@@ -99,6 +99,8 @@ struct pkg_solved {
 	struct pkg_job_universe_item *items[2];
 	struct pkg_solved *xlink;	/* link split jobs together */
 	pkg_solved_t type;
+	int scc;			/* strongly connected component in the
+					   install graph, for scheduling */
 	enum pkg_solved_cycle_mark mark;/* scheduling cycle detection */
 	struct pkg_solved *path_prev;	/* scheduling cycle detection */
 };
@@ -112,9 +114,9 @@ struct pkg_job_provide {
 typedef vec_t(struct pkg_job_provide) providev_t;
 
 struct pkg_jobs_universe {
-	pkghash *items;		/* package uid -> universe_itemv_t * */
-	pkghash *seen;		/* package digest -> universe_itemv_t * */
-	pkghash *provides;	/* shlibs, pkg_job_provide */
+	hash_t *items;		/* package uid -> universe_itemv_t * */
+	hash_t *seen;		/* package digest -> universe_itemv_t * */
+	hash_t *provides;	/* shlibs, pkg_job_provide */
 	struct pkg_jobs *j;
 	size_t nitems;
 	int rdeps_depth;	/* track rdeps recursion to prevent explosion */
@@ -137,8 +139,8 @@ typedef vec_t(struct job_pattern) job_patternv_t;
 
 struct pkg_jobs {
 	struct pkg_jobs_universe *universe;
-	pkghash	*request_add;
-	pkghash	*request_delete;
+	hash_t	*request_add;
+	hash_t	*request_delete;
 	pkg_solved_list	 jobs;
 	struct pkgdb	*db;
 	pkg_jobs_t	 type;

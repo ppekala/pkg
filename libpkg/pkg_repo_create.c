@@ -73,7 +73,6 @@ hash_file(struct pkg_repo_meta *meta, struct pkg *pkg, char *path)
 	while (strstr(rel_dir, "/Hashed") != NULL) {
 		rel_dir = get_dirname(rel_dir);
 	}
-	strlcpy(tmp_name, rel_dir, sizeof(tmp_name));
 	rel_dir = (char *)&tmp_name;
 
 	rel_repo = path;
@@ -101,11 +100,10 @@ hash_file(struct pkg_repo_meta *meta, struct pkg *pkg, char *path)
 	while (rel_link[0] == '/')
 		rel_link++;
 
-	snprintf(tmp_name, sizeof(tmp_name), "%s/%s", rel_dir, PKG_HASH_DIR);
-	rel_dir = (char *)&tmp_name;
-	if (!is_dir(rel_dir)) {
-		pkg_debug(1, "Making directory: %s", rel_dir);
-		(void)pkg_mkdirs(rel_dir);
+	strlcat(tmp_name, "/" PKG_HASH_DIR, sizeof(tmp_name));
+	if (!is_dir(tmp_name)) {
+		pkg_debug(1, "Making directory: %s", tmp_name);
+		(void)pkg_mkdirs(tmp_name);
 	}
 
 	if (!STREQ(path, hash_name)) {
@@ -284,6 +282,7 @@ pkg_create_repo_read_fts(fts_item_t *items, FTS *fts,
 
 struct thr_env {
 	int ntask;
+	bool failed;
 	FILE *ffile;
 	FILE *mfile;
 	FILE *dfile;
@@ -294,7 +293,7 @@ struct thr_env {
 	pthread_mutex_t llock;
 	pthread_mutex_t flock;
 	pthread_cond_t cond;
-	pkghash *file_dirs;
+	hash_t *file_dirs;
 	int nfile_dirs;
 };
 
@@ -335,8 +334,19 @@ pkg_create_repo_thread(void *arg)
 			pkg->pkgsize = st.st_size;
 			if (te->meta->hash) {
 				ret = hash_file(te->meta, pkg, path);
-				if (ret != EPKG_OK)
+				if (ret != EPKG_OK) {
+					/*
+					 * Wake the main thread up before
+					 * bailing out: it waits for every
+					 * item to be accounted for.
+					 */
+					pthread_mutex_lock(&te->nlock);
+					te->failed = true;
+					te->ntask++;
+					pthread_cond_signal(&te->cond);
+					pthread_mutex_unlock(&te->nlock);
 					goto cleanup;
+				}
 			} else {
 				pkg->repopath = xstrdup(repopath);
 			}
@@ -600,9 +610,63 @@ pkg_repo_create_set_metafile(struct pkg_repo_create *prc, const char *metafile)
 void
 pkg_repo_create_set_sign(struct pkg_repo_create *prc, char **argv, int argc, pkg_password_cb *cb)
 {
-	prc->sign.argc = argc;
-	prc->sign.argv = argv;
+	int	 i;
+	char	*cpos;
+	sb_t	 cmd = sb_init();
+
+	pkg_debug(1, "Got call to legacy signing option");
+
+	pkg_repo_create_set_password_cb(prc, cb);
+
+	/* Legacy calling convention for signing. Convert to new style. */
+	if (argc == 1) {
+		/* Should be rsa:path/to/key.pem */
+		if ((cpos = strchr(argv[0], ':')) == NULL) {
+			/* No type detected, assume "rsa" */
+			pkg_repo_create_set_signtype(prc, "rsa");
+			pkg_repo_create_set_signkey(prc, argv[0]);
+		} else {
+			cpos[0] = '\0';
+			pkg_repo_create_set_signtype(prc, argv[0]);
+			pkg_repo_create_set_signkey(prc, cpos + 1);
+		}
+	} else if (argc > 2) {
+		/* Should be "signing_command: sign.sh arg arg" */
+		if (STREQ(argv[0], "signing_command:")) {
+			for (i = 1; i < argc; i++) {
+				if (strspn(argv[i], " \t\n") > 0)
+					sb_printf(&cmd, " \"%s\" ", argv[i]);
+				else
+					sb_printf(&cmd, " %s ", argv[i]);
+			}
+			/* This leaks the string. Not interested in taking over mem mgmt. */
+			pkg_repo_create_set_signcmd(prc, sb_get(&cmd));
+		}
+	}
+}
+
+void
+pkg_repo_create_set_password_cb(struct pkg_repo_create *prc, pkg_password_cb *cb)
+{
 	prc->sign.cb = cb;
+}
+
+void
+pkg_repo_create_set_signtype(struct pkg_repo_create *prc, const char *signtype)
+{
+	prc->sign.type = signtype;
+}
+
+void
+pkg_repo_create_set_signcmd(struct pkg_repo_create *prc, const char *signcmd)
+{
+	prc->sign.cmd = signcmd;
+}
+
+void
+pkg_repo_create_set_signkey(struct pkg_repo_create *prc, const char *signkey)
+{
+	prc->sign.key = signkey;
 }
 
 static int
@@ -610,41 +674,25 @@ pkg_repo_create_pack_and_sign(struct pkg_repo_create *prc)
 {
 	char repo_path[MAXPATHLEN];
 	char repo_archive[MAXPATHLEN];
-	char *key_file;
-	const char *key_type;
 	struct pkgsign_ctx *sctx = NULL;
 	struct stat st;
 	int ret = EPKG_OK, nfile = 0;
 	const int files_to_pack = 4;
 
-	if (prc->sign.argc == 1) {
-		char *cpos;
+	if (prc->sign.type == NULL)
+		prc->sign.type = "rsa";
 
-		key_type = key_file = prc->sign.argv[0];
-		if ((cpos = strchr(key_type, ':')) != NULL) {
-			key_file = cpos + 1;
-			*(key_file - 1) = '\0';
-		} else {
-			key_type = "rsa";
-		}
-
-		pkg_debug(1, "Loading %s key from '%s' for signing", key_type, key_file);
-		ret = pkgsign_new_sign(key_type, &sctx);
-		if (ret != EPKG_OK) {
-			pkg_emit_error("'%s' signer not found", key_type);
-			return (EPKG_FATAL);
-		}
-
-		pkgsign_set(sctx, prc->sign.cb, key_file);
-		ret = EPKG_OK;
+	ret = pkgsign_new_sign(prc->sign.type, &sctx);
+	if (ret != EPKG_OK) {
+		pkg_emit_error("unknown sign type '%s'", prc->sign.type);
+		return (EPKG_FATAL);
 	}
 
-	if (prc->sign.argc > 1 && !STREQ(prc->sign.argv[0], "signing_command:"))
-		return (EPKG_FATAL);
+	if (prc->sign.key != NULL) {
 
-	if (prc->sign.argc > 1) {
-		prc->sign.argc--;
-		prc->sign.argv++;
+		pkg_debug(1, "Loading %s key from '%s' for signing", prc->sign.type, prc->sign.key);
+		pkgsign_set(sctx, prc->sign.cb, prc->sign.key);
+		ret = EPKG_OK;
 	}
 
 	pkg_emit_progress_start("Packing files for repository");
@@ -882,7 +930,7 @@ pkg_repo_create(struct pkg_repo_create *prc, char *path)
 	}
 
 	pthread_mutex_lock(&te.nlock);
-	while (te.ntask < len) {
+	while (te.ntask < len && !te.failed) {
 		pthread_cond_wait(&te.cond, &te.nlock);
 		pkg_emit_progress_tick(te.ntask, len);
 	}
@@ -891,6 +939,9 @@ pkg_repo_create(struct pkg_repo_create *prc, char *path)
 	for (int i = 0; i < num_workers; i++)
 		pthread_join(threads[i], NULL);
 	free(threads);
+
+	if (te.failed)
+		goto cleanup;
 
 	/* Assemble filelist: write dictionary header + package data */
 	if (te.ffile != NULL && te.file_dirs != NULL) {
@@ -911,7 +962,7 @@ pkg_repo_create(struct pkg_repo_create *prc, char *path)
 			 */
 			struct dir_entry *dirs = xcalloc(te.nfile_dirs,
 			    sizeof(struct dir_entry));
-			pkghash_foreach(te.file_dirs, hit) {
+			hash_foreach(te.file_dirs, hit) {
 				int idx = (int)(intptr_t)hit.value;
 				dirs[idx].path = hit.key;
 				dirs[idx].old_idx = idx;
@@ -972,7 +1023,7 @@ pkg_repo_create(struct pkg_repo_create *prc, char *path)
 
 			fclose(final);
 		}
-		pkghash_destroy(te.file_dirs);
+		hash_destroy(te.file_dirs);
 		te.file_dirs = NULL;
 	}
 
@@ -1024,12 +1075,11 @@ cleanup:
 }
 
 static int
-pkg_repo_sign(const char *path, char **argv, int argc, char **sig, size_t *siglen,
-    char **sigtype, char **cert, size_t *certlen)
+pkg_repo_sign(const char *path, struct pkgsign_ctx *sctx, const char *cmd, char **sig,
+    size_t *siglen, char **sigtype, char **cert, size_t *certlen)
 {
 	FILE *fps[2];
-	char *sha256;
-	sb_t cmd = sb_init();
+	char *digest;
 	sb_t sigstr = sb_init();
 	sb_t certstr = sb_init();
 	sb_t typestr = sb_init();
@@ -1038,27 +1088,22 @@ pkg_repo_sign(const char *path, char **argv, int argc, char **sig, size_t *sigle
 	size_t linecap = 0;
 	ssize_t linelen;
 	pid_t spid;
-	int i, pstatus, ret = EPKG_OK;
+	int pstatus, ret = EPKG_OK;
 	bool end_seen = false;
 
-	sha256 = pkg_checksum_file(path, PKG_HASH_TYPE_SHA256_HEX);
-	if (!sha256)
+	assert(sctx);
+
+	digest = pkg_checksum_file(path, pkgsign_get_digest(sctx));
+	if (!digest)
 		return (EPKG_FATAL);
 
-	for (i = 0; i < argc; i++) {
-		if (strspn(argv[i], " \t\n") > 0)
-			sb_printf(&cmd, " \"%s\" ", argv[i]);
-		else
-			sb_printf(&cmd, " %s ", argv[i]);
-	}
-
-
-	if ((spid = process_spawn_pipe(fps, sb_str(&cmd))) < 0) {
+	pkg_debug(1, "running signing command: '%s' on input %s", cmd, digest);
+	if ((spid = process_spawn_pipe(fps, cmd)) < 0) {
 		ret = EPKG_FATAL;
 		goto done;
 	}
 
-	fprintf(fps[1], "%s\n", sha256);
+	fprintf(fps[1], "%s\n", digest);
 	fflush(fps[1]);
 
 	while ((linelen = getline(&line, &linecap, fps[0])) > 0 ) {
@@ -1081,7 +1126,9 @@ pkg_repo_sign(const char *path, char **argv, int argc, char **sig, size_t *sigle
 	free(line);
 
 	*sigtype = sb_get(&typestr);
+	*certlen = certstr.len;
 	*cert = sb_get(&certstr);
+	*siglen = sigstr.len;
 	*sig = sb_get(&sigstr);
 
 	/*
@@ -1100,8 +1147,7 @@ pkg_repo_sign(const char *path, char **argv, int argc, char **sig, size_t *sigle
 	fclose(fps[1]);
 
 done:
-	free(sha256);
-	sb_fini(&cmd);
+	free(digest);
 
 	return (ret);
 }
@@ -1151,8 +1197,8 @@ pack_sign(struct packing *pack, struct pkgsign_ctx *sctx, const char *path,
 }
 
 static int
-pack_command_sign(struct packing *pack, const char *path, char **argv, int argc,
-    const char *name)
+pack_command_sign(struct packing *pack, struct pkgsign_ctx *sctx, const char *path,
+    const char *cmd, const char *name)
 {
 	size_t pub_len = 0, signature_len = 0;
 	char fname[MAXPATHLEN];
@@ -1161,10 +1207,12 @@ pack_command_sign(struct packing *pack, const char *path, char **argv, int argc,
 	struct iovec iov[2];
 	int offset, size;
 
+	assert(sctx);
+
 	sig = NULL;
 	pub = NULL;
 
-	if (pkg_repo_sign(path, argv, argc, &sig, &signature_len, &sigtype, &pub,
+	if (pkg_repo_sign(path, sctx, cmd, &sig, &signature_len, &sigtype, &pub,
 	    &pub_len) != EPKG_OK) {
 		free(sig);
 		free(pub);
@@ -1222,13 +1270,15 @@ pkg_repo_pack_db(const char *name, const char *archive, char *path,
 	struct packing *pack;
 	int ret = EPKG_OK;
 
+	assert(sctx);
+
 	if (packing_init(&pack, archive, prc->meta->packing_format, -1, 0, (time_t)-1, true) != EPKG_OK)
 		return (EPKG_FATAL);
 
-	if (sctx != NULL) {
+	if (prc->sign.key != NULL) {
 		ret = pack_sign(pack, sctx, path, "signature");
-	} else if (prc->sign.argc >= 1) {
-		ret = pack_command_sign(pack, path, prc->sign.argv, prc->sign.argc, name);
+	} else if (prc->sign.cmd != NULL) {
+		ret = pack_command_sign(pack, sctx, path, prc->sign.cmd, name);
 	}
 	packing_append_file_attr(pack, path, name, "root", "wheel", 0644, 0);
 

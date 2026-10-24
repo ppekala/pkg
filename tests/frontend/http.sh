@@ -2,12 +2,14 @@
 
 . $(atf_get_srcdir)/test_environment.sh
 
-CLEANUP="simple_fetch simple_repo simple_audit"
+CLEANUP="simple_fetch simple_repo simple_audit server_ignores_ims server_sends_304"
 
 tests_init \
 	simple_fetch \
 	simple_repo \
-	simple_audit
+	simple_audit \
+	server_ignores_ims \
+	server_sends_304
 
 
 httpd_startup() {
@@ -30,7 +32,7 @@ httpd_startup() {
 httpd_cleanup() {
 	pid=$(cat ${TMPDIR}/http.pid)
 	if [ -z "${pid}" ]; then
-	    return 1
+	    return 0
 	fi
 	if kill -s 0 ${pid}; then
 	    kill -s INT ${pid}
@@ -125,6 +127,126 @@ EOF
 
 }
 simple_audit_cleanup()
+{
+    httpd_cleanup
+}
+
+# Same as httpd_startup() but the server always answers 200, even when the
+# client sent an If-Modified-Since header.
+httpd_startup_noims()
+{
+	pidfile=${TMPDIR}/http.pid
+	statusfile=${TMPDIR}/http.status
+	: > ${pidfile}
+	: > ${statusfile}
+
+	cat > ${TMPDIR}/noims.py << 'EOF'
+import functools, http.server, sys
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    # always pretend the file changed, ignoring the conditional request
+    def send_head(self):
+        if 'If-Modified-Since' in self.headers:
+            del self.headers['If-Modified-Since']
+        return super().send_head()
+
+with http.server.HTTPServer(('127.0.0.1', 0),
+        functools.partial(Handler, directory=sys.argv[1])) as httpd:
+    print('http://%s:%d' % (httpd.server_address[0], httpd.server_address[1]),
+        flush=True)
+    httpd.serve_forever()
+EOF
+	python3 -u ${TMPDIR}/noims.py "$1" > ${statusfile} &
+	jobs -p %1 > ${pidfile}
+	while kill -s 0 %1 && ! [ -s ${statusfile} ]; do
+	    sleep .1
+	done
+	url=$(cat ${statusfile})
+	atf_check test -n "${url}"
+}
+
+server_ignores_ims_body()
+{
+	atf_require python3 "Requires python3 to run this test"
+
+	atf_check sh ${RESOURCEDIR}/test_subr.sh new_pkg test test 1
+	atf_check pkg create -M test.ucl
+	mkdir repo
+	mv test-1.txz test-1.pkg repo/
+	atf_check -o ignore pkg repo repo
+
+	httpd_startup_noims ${TMPDIR}/repo
+
+	cat > pkg.conf << EOF
+PKG_DBDIR=${TMPDIR}
+PKG_CACHEDIR=${TMPDIR}/cache
+REPOS_DIR=[]
+repositories: {
+	local: { url: ${url} }
+}
+EOF
+	atf_check -o ignore pkg -C ./pkg.conf update
+
+	# The server answers 200 with an unchanged Last-Modified instead of
+	# 304, the catalogue must not be fetched again.
+	atf_check -o match:"local repository is up to date" \
+		pkg -C ./pkg.conf update
+}
+
+server_ignores_ims_cleanup()
+{
+    httpd_cleanup
+}
+
+# Same as httpd_startup() but also captures the request log so that a test
+# can check which status code the server answered.
+httpd_startup_log()
+{
+	pidfile=${TMPDIR}/http.pid
+	logfile=${TMPDIR}/http.log
+	: > ${pidfile}
+	: > ${logfile}
+
+	python3 -u -m http.server -d "$1" --bind 127.0.0.1 0 \
+		> ${logfile} 2>&1 &
+	jobs -p %1 > ${pidfile}
+	while kill -s 0 %1 && ! grep -q "Serving HTTP" ${logfile}; do
+	    sleep .1
+	done
+	url=$(sed -n 's#.*(\(http://.*\)/).*#\1#p' ${logfile})
+	atf_check test -n "${url}"
+}
+
+server_sends_304_body()
+{
+	atf_require python3 "Requires python3 to run this test"
+
+	atf_check sh ${RESOURCEDIR}/test_subr.sh new_pkg test test 1
+	atf_check pkg create -M test.ucl
+	mkdir repo
+	mv test-1.txz test-1.pkg repo/
+	atf_check -o ignore pkg repo repo
+
+	httpd_startup_log ${TMPDIR}/repo
+
+	cat > pkg.conf << EOF
+PKG_DBDIR=${TMPDIR}
+PKG_CACHEDIR=${TMPDIR}/cache
+REPOS_DIR=[]
+repositories: {
+	local: { url: ${url} }
+}
+EOF
+	atf_check -o ignore pkg -C ./pkg.conf update
+
+	# The server honours If-Modified-Since: it answers 304 and pkg must
+	# report the catalogue as up to date.
+	atf_check -o match:"local repository is up to date" \
+		pkg -C ./pkg.conf update
+	atf_check grep -q " 304 " ${TMPDIR}/http.log
+}
+
+server_sends_304_cleanup()
 {
     httpd_cleanup
 }
